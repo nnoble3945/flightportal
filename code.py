@@ -1,18 +1,20 @@
+import os
 import time
+
 from random import randrange
 import board
 import terminalio
 from adafruit_matrixportal.matrixportal import MatrixPortal
 from adafruit_portalbase.network import HttpError
-import adafruit_requests as requests
+import adafruit_requests
 import json
 
+import adafruit_connection_manager
+
 import adafruit_display_text.label
-import board
 import displayio
 import framebufferio
 import rgbmatrix
-import terminalio
 import gc
 
 import busio
@@ -35,10 +37,15 @@ except ImportError:
     print("Secrets including geo are kept in secrets.py, please add them there!")
     raise
 
+ssid = os.getenv("CIRCUITPY_WIFI_SSID")
+password = os.getenv("CIRCUITPY_WIFI_PASSWORD")
+#Area to search for flights, see settings.toml file
+BOUNDS_BOX = os.getenv("bounds_box")
+
 # How often to query fr24 - quick enough to catch a plane flying over, not so often as to cause any issues, hopefully
 QUERY_DELAY=30
 #Area to search for flights, see secrets file
-BOUNDS_BOX=secrets["bounds_box"]
+#BOUNDS_BOX=secrets["bounds_box"]
 
 # Colours and timings
 ROW_ONE_COLOUR=0xEE82EE
@@ -73,16 +80,16 @@ esp32_cs = DigitalInOut(board.ESP_CS)
 esp32_ready = DigitalInOut(board.ESP_BUSY)
 esp32_reset = DigitalInOut(board.ESP_RESET)
 spi = busio.SPI(board.SCK, board.MOSI, board.MISO)
-esp = adafruit_esp32spi.ESP_SPIcontrol(spi, esp32_cs, esp32_ready, esp32_reset)
+radio = adafruit_esp32spi.ESP_SPIcontrol(spi, esp32_cs, esp32_ready, esp32_reset)
 status_light = neopixel.NeoPixel(
     board.NEOPIXEL, 1, brightness=0.2
 )
-wifi = adafruit_esp32spi_wifimanager.ESPSPI_WiFiManager(esp, secrets, status_light,debug=False,attempts=1)
+wifi = adafruit_esp32spi_wifimanager.ESPSPI_WiFiManager(radio, secrets, status_light, debug=False, attempts=1)
 
 # Top level matrixportal object
 matrixportal = MatrixPortal(
     headers=rheaders,
-    esp=esp,
+    esp=radio,
     rotation=0,
     debug=False
 )
@@ -141,11 +148,11 @@ g = displayio.Group()
 g.append(label1)
 g.append(label2)
 g.append(label3)
-matrixportal.display.show(g)
+matrixportal.display.root_group = g
 
 # Scroll the plane bitmap right to left (same direction as scrolling text)
 def plane_animation():
-    matrixportal.display.show(planeG)
+    matrixportal.display.root_group = planeG
     for i in range(matrixportal.display.width+24,-12,-1):
             planeG.x=i
             w.feed()
@@ -161,31 +168,31 @@ def scroll(line):
         w.feed()
         time.sleep(TEXT_SPEED)
         #matrixportal.display.refresh(minimum_frames_per_second=0)
-        
+
 
 # Populate the labels, then scroll longer versions of the text
 def display_flight():
 
-    matrixportal.display.show(g)
+    matrixportal.display.root_group = g
     label1.text=label1_short
     label2.text=label2_short
     label3.text=label3_short
     time.sleep(PAUSE_BETWEEN_LABEL_SCROLLING)
-    
+
     label1.x=matrixportal.display.width+1
     label1.text=label1_long
     scroll(label1)
     label1.text=label1_short
     label1.x=1
     time.sleep(PAUSE_BETWEEN_LABEL_SCROLLING)
-    
+
     label2.x=matrixportal.display.width+1
     label2.text=label2_long
     scroll(label2)
     label2.text=label2_short
     label2.x=1
     time.sleep(PAUSE_BETWEEN_LABEL_SCROLLING)
-    
+
     label3.x=matrixportal.display.width+1
     label3.text=label3_long
     scroll(label3)
@@ -212,6 +219,11 @@ def get_flight_details(fn):
     # zero out any old data in the byte array
     for i in range(0,json_size):
         json_bytes[i]=0
+
+    # Initialize a requests session
+    pool = adafruit_connection_manager.get_radio_socketpool(radio)
+    ssl_context = adafruit_connection_manager.get_radio_ssl_context(radio)
+    requests = adafruit_requests.Session(pool, ssl_context)
 
     # Get the URL response one chunk at a time
     try:
@@ -248,8 +260,8 @@ def get_flight_details(fn):
                     # Stop reading chunks
                     print("Details lookup saved "+str(trail_end)+" bytes.")
                     return True
-    # Handle occasional URL fetching errors            
-    except (RuntimeError, OSError, HttpError) as e:
+    # Handle occasional URL fetching errors
+    except (RuntimeError, OSError) as e:
             print("Error--------------------------------------------------")
             print(e)
             return False
@@ -257,7 +269,7 @@ def get_flight_details(fn):
     #If we got here we got through all the JSON without finding the right trail entries
     print("Failed to find a valid trail entry in JSON")
     return False
-    
+
 
 # Look at the byte array that fetch_details saved into and extract any fields we want
 def parse_details_json():
@@ -358,41 +370,39 @@ def parse_details_json():
 
 
 def checkConnection():
-    print("Check and reconnect WiFi")
-    attempts=10
-    attempt=1
-    while (not esp.status == adafruit_esp32spi.WL_CONNECTED) and attempt<attempts:
-        print("Connect attempt "+str(attempt)+" of "+str(attempts))
-        print("Reset ESP...")
-        w.feed()
-        wifi.reset()
-        print("Attempt WiFi connect...")
-        w.feed()
+    print("Connecting to AP...")
+    while not radio.is_connected:
         try:
-            wifi.connect()
-        except OSError as e:
-            print(e.__class__.__name__+"--------------------------------------")
-            print(e)
-        attempt+=1
-    if esp.status == adafruit_esp32spi.WL_CONNECTED:
-        print("Successfully connected.")
-    else:
-        print("Failed to connect.")
+            w.feed()
+            radio.connect_AP(ssid, password)
+        except (RuntimeError, ConnectionError) as e:
+            print("Could not connect to AP, retrying...")
+            continue
+    print("Connected!")
+    
 
+def check_memory():
+    free_mem = gc.mem_free()
+    print(f"Free memory: {free_mem} bytes")
+    if free_mem < 10000:  # You can adjust this threshold.
+        print("Low memory warning, forcing garbage collection.")
+        gc.collect()
 
 # Look for flights overhead
 def get_flights():
     matrixportal.url=FLIGHT_SEARCH_URL
+
     try:
         #response = json.loads(matrixportal.fetch())
-        response=requests.get(url=FLIGHT_SEARCH_URL,headers=rheaders).json()
+        response = requests.get(url=FLIGHT_SEARCH_URL,headers=rheaders).json()
     except (RuntimeError,OSError, HttpError, ValueError, requests.OutOfRetries) as e:
         print(e.__class__.__name__+"--------------------------------------")
         print(e)
         checkConnection()
         return False
+    print ("Flight found: " + str(len(response)))
+    print (str(response))
     if len(response)==3:
-        #print ("Flight found.")
         for flight_id, flight_info in response.items():
             # the JSON has three main fields, we want the one that's a flight ID
             if not (flight_id=="version" or flight_id=="full_count"):
@@ -407,6 +417,14 @@ def get_flights():
 
 checkConnection()
 
+# Initialize a requests session
+print("Initializing Session...")
+pool = adafruit_connection_manager.get_radio_socketpool(radio)
+ssl_context = adafruit_connection_manager.get_radio_ssl_context(radio)
+requests = adafruit_requests.Session(pool, ssl_context)
+
+print("Waiting for while loop...")
+
 last_flight=''
 while True:
 
@@ -414,12 +432,15 @@ while True:
 
     w.feed()
 
-    #print("memory free: " + str(gc.mem_free()))
+    print("memory free: " + str(gc.mem_free()))
 
-    #print("Get flights...")
+    print("Get flights...")
     flight_id=get_flights()
+
+    print(flight_id)
+
     w.feed()
-    
+
 
     if flight_id:
         if flight_id==last_flight:
@@ -438,16 +459,17 @@ while True:
                     print("error parsing JSON, skip displaying this flight")
             else:
                 print("error loading details, skip displaying this flight")
-            
+
             last_flight=flight_id
     else:
         #print("No flights found, clear display")
         clear_flight()
-    
+
     time.sleep(5)
 
 
     for i in range(0,QUERY_DELAY,+5):
         time.sleep(5)
         w.feed()
-    gc.collect()
+    gc.collect()# Write your code here :-)
+
