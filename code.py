@@ -220,11 +220,6 @@ def get_flight_details(fn):
     for i in range(0,json_size):
         json_bytes[i]=0
 
-    # Initialize a requests session
-    pool = adafruit_connection_manager.get_radio_socketpool(radio)
-    ssl_context = adafruit_connection_manager.get_radio_ssl_context(radio)
-    requests = adafruit_requests.Session(pool, ssl_context)
-
     # Get the URL response one chunk at a time
     try:
         response=requests.get(url=FLIGHT_LONG_DETAILS_HEAD+fn,headers=rheaders)
